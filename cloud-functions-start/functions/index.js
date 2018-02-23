@@ -13,6 +13,103 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+const admin = require('firebase-admin');
+const functions = require('firebase-functions');
+admin.initializeApp(functions.config().firebase);
+const gcs = require('@google-cloud/storage')();
+const Vision = require('@google-cloud/vision');
+const vision = new Vision();
+const spawn = require('child-process-promise').spawn;
+const path = require('path');
+const os = require('os');
+const fs = require('fs');
+
+const blurImage = (filePath, bucketName, metadata) => {
+  const tempLocalFile = path.join(os.tmpdir(), path.basename(filePath));
+  const messageId = filePath.split(path.sep)[1];
+  const bucket = gcs.bucket(bucketName);
+
+  // Download file from bucket.
+  return bucket.file(filePath).download({destination: tempLocalFile})
+    .then(() => {
+      console.log('Image has been downloaded to', tempLocalFile);
+
+      // Blur the image using ImageMagick.
+      return spawn('convert', [tempLocalFile, '-channel', 'RGBA', '-blur', '0x24', tempLocalFile]);
+    })
+    .then(() => {
+      console.log('Image has been blurred');
+
+      // Uploading the Blurred image back into the bucket.
+      return bucket.upload(tempLocalFile, {destination: filePath});
+    })
+    .then(() => {
+      console.log('Blurred image has been uploaded to', filePath);
+
+      // Deleting the local file to free up disk space.
+      fs.unlinkSync(tempLocalFile);
+      console.log('Deleted local file.');
+
+      // Indicate that the message has been moderated.
+      return admin.database().ref(`/messages/${messageId}`).update({moderated: true});
+    })
+    .then(() => {
+      console.log('Marked the image as moderated in the database.');
+    });
+};
+
+const blurOffensiveImages = functions.storage.object().onChange(event => {
+  const object = event.data;
+
+  // Exit if this is a deletion or a deploy event.
+  if (object.resourceState === 'not_exists') {
+    return console.log('This is a deletion event.');
+  } else if (!object.name) {
+    return console.log('This is a deploy event.');
+  }
+
+  const image = {
+    source: {imageUri: `gs://${object.bucket}/${object.name}`}
+  };
+
+  // Check the image content using the Cloud Vision API.
+  return vision.safeSearchDetection(image)
+    .then(batchAnnotateImagesResponse => {
+      const safeSearchResult = batchAnnotateImagesResponse[0].safeSearchAnnotation;
+      const Likelihood = Vision.types.Likelihood;
+      if (Likelihood[safeSearchResult.adult] >= Likelihood.LIKELY ||
+        Likelihood[safeSearchResult.violence] >= Likelihood.LIKELY) {
+        console.log('The image', object.name, 'has been detected as inappropriate.');
+        return blurImage(object.name, object.bucket);
+      } else {
+        console.log('The image', object.name, 'has been detected as OK.');
+      }
+    });
+});
+
+const addWelcomeMessages = functions.auth.user().onCreate(event => {
+  const user = event.data;
+  console.log('A new user signed in for the first time.');
+  const fullName = user.displayName || 'Anonymous';
+
+  // Saves the new welcome message into the database
+  // which then displays it in the FriendlyChat clients.
+  return admin
+    .database()
+    .ref('messages')
+    .push({
+      name: 'Firebase Bot',
+      photoUrl: '/images/firebase-logo.png', // Firebase logo
+      text: `${fullName} signed in for the first time! Welcome!` // Using back-ticks.
+    })
+    .then(() => console.log('Welcome message written to database.'));
+});
+
+module.exports = {
+  addWelcomeMessages,
+  blurOffensiveImages
+};
+
 
 // TODO(DEVELOPER): Import the Cloud Functions for Firebase and the Firebase Admin modules here.
 
